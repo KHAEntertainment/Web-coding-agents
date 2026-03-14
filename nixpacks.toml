@@ -4,8 +4,9 @@
 providers = ["node"]
 
 [phases.setup]
-# Use Node 20 and pnpm from nixpkgs for reproducibility
-nixPkgs = ["nodejs_20", "pnpm"]
+# Use Node 20 from nixpkgs; install pnpm via npm since pnpm is no longer a standalone nixpkg
+nixPkgs = ["nodejs_20"]
+cmds = ["npm install -g pnpm@9"]
 
 [variables]
 NODE_ENV = "production"
