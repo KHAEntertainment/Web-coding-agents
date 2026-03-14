@@ -1,17 +1,20 @@
 import { Sandbox } from '@vercel/sandbox'
-import { runCommandInSandbox } from '../commands'
+import { runCommandInSandbox, runInProject, PROJECT_DIR } from '../commands'
 import { AgentExecutionResult } from '../types'
 import { redactSensitiveInfo } from '@/lib/utils/logging'
 import { TaskLogger } from '@/lib/utils/task-logger'
+import { connectors } from '@/lib/db/schema'
 
-// Helper function to run command and log it
+type Connector = typeof connectors.$inferSelect
+
+// Helper function to run command and log it in project directory
 async function runAndLogCommand(sandbox: Sandbox, command: string, args: string[], logger: TaskLogger) {
   const fullCommand = args.length > 0 ? `${command} ${args.join(' ')}` : command
   const redactedCommand = redactSensitiveInfo(fullCommand)
 
   await logger.command(redactedCommand)
 
-  const result = await runCommandInSandbox(sandbox, command, args)
+  const result = await runInProject(sandbox, command, args)
 
   // Only try to access properties if result is valid
   if (result && result.output && result.output.trim()) {
@@ -45,6 +48,7 @@ export async function executeGeminiInSandbox(
   instruction: string,
   logger: TaskLogger,
   selectedModel?: string,
+  mcpServers?: Connector[],
 ): Promise<AgentExecutionResult> {
   try {
     // Executing Gemini CLI with instruction
@@ -79,6 +83,90 @@ export async function executeGeminiInSandbox(
           cliName: 'gemini',
           changesDetected: false,
         }
+      }
+    }
+
+    // Configure MCP servers if provided
+    if (mcpServers && mcpServers.length > 0) {
+      await logger.info('Configuring MCP servers')
+
+      // Create Gemini settings.json configuration file
+      const settingsConfig: {
+        mcpServers: Record<
+          string,
+          | { httpUrl: string; headers?: Record<string, string> }
+          | { command: string; args?: string[]; env?: Record<string, string> }
+        >
+      } = {
+        mcpServers: {},
+      }
+
+      for (const server of mcpServers) {
+        const serverName = server.name.toLowerCase().replace(/[^a-z0-9]/g, '-')
+
+        if (server.type === 'local') {
+          // Local STDIO server - parse command string into command and args
+          const commandParts = server.command!.trim().split(/\s+/)
+          const executable = commandParts[0]
+          const args = commandParts.slice(1)
+
+          // Parse env from JSON string if present
+          let envObject: Record<string, string> | undefined
+          if (server.env) {
+            try {
+              envObject = JSON.parse(server.env)
+            } catch (e) {
+              await logger.info('Warning: Failed to parse env for MCP server')
+            }
+          }
+
+          settingsConfig.mcpServers[serverName] = {
+            command: executable,
+            ...(args.length > 0 ? { args } : {}),
+            ...(envObject ? { env: envObject } : {}),
+          }
+          await logger.info('Added local MCP server')
+        } else {
+          // Remote HTTP server
+          settingsConfig.mcpServers[serverName] = {
+            httpUrl: server.baseUrl!,
+          }
+
+          // Build headers object
+          const headers: Record<string, string> = {}
+          if (server.oauthClientSecret) {
+            headers.Authorization = `Bearer ${server.oauthClientSecret}`
+          }
+          if (server.oauthClientId) {
+            headers['X-Client-ID'] = server.oauthClientId
+          }
+          if (Object.keys(headers).length > 0) {
+            settingsConfig.mcpServers[serverName].headers = headers
+          }
+
+          await logger.info('Added remote MCP server')
+        }
+      }
+
+      // Write the settings.json file to ~/.gemini/
+      const settingsJson = JSON.stringify(settingsConfig, null, 2)
+      const createSettingsCmd = `mkdir -p ~/.gemini && cat > ~/.gemini/settings.json << 'EOF'
+${settingsJson}
+EOF`
+
+      await logger.info('Creating Gemini MCP settings file...')
+      const settingsResult = await runCommandInSandbox(sandbox, 'sh', ['-c', createSettingsCmd])
+
+      if (settingsResult.success) {
+        await logger.info('Gemini settings.json file created successfully')
+
+        // Verify the file was created (without logging sensitive contents)
+        const verifySettings = await runCommandInSandbox(sandbox, 'test', ['-f', '~/.gemini/settings.json'])
+        if (verifySettings.success) {
+          await logger.info('Gemini MCP configuration verified')
+        }
+      } else {
+        await logger.info('Warning: Failed to create Gemini settings.json file')
       }
     }
 
@@ -117,7 +205,7 @@ export async function executeGeminiInSandbox(
     // Add model selection if provided
     if (selectedModel) {
       args.push('-m', selectedModel)
-      await logger.info(`Using model: ${selectedModel}`)
+      await logger.info('Using selected model')
     }
 
     // Use YOLO mode to auto-approve all tools (bypass approval prompts)
@@ -126,12 +214,11 @@ export async function executeGeminiInSandbox(
     // Add output format for structured responses
     args.push('-o', 'json')
 
-    // Add the instruction as positional argument (not using deprecated -p flag)
-    args.push(instruction)
+    // Don't add instruction to args array - we'll add it quoted separately to the command string
 
     // Log what we're trying to do
-    await logger.info(`Executing Gemini CLI with ${authMethod} authentication`)
-    const redactedCommand = `gemini ${args.slice(0, -1).join(' ')} "${instruction.substring(0, 100)}..."`
+    await logger.info('Executing Gemini CLI with authentication')
+    const redactedCommand = `gemini ${args.join(' ')} "${instruction.substring(0, 100)}..."`
     await logger.command(redactedCommand)
 
     // Build environment variables string for shell command (like other agents)
@@ -143,7 +230,10 @@ export async function executeGeminiInSandbox(
     await logger.info('Attempting Gemini CLI execution with basic flags...')
 
     // Execute Gemini CLI with proper environment using shell command
-    const fullCommand = envPrefix ? `${envPrefix} gemini ${args.join(' ')}` : `gemini ${args.join(' ')}`
+    // IMPORTANT: Wrap instruction in quotes to prevent CLI option parsing issues
+    const fullCommand = envPrefix
+      ? `${envPrefix} gemini ${args.join(' ')} "${instruction}"`
+      : `gemini ${args.join(' ')} "${instruction}"`
     let result = await runCommandInSandbox(sandbox, 'sh', ['-c', fullCommand])
 
     // If that fails with tool registry error, try with different approval modes
@@ -155,20 +245,20 @@ export async function executeGeminiInSandbox(
       }
       fallbackArgs.push('--approval-mode', 'auto_edit') // Auto-approve edit tools only
       fallbackArgs.push('-o', 'text') // Use text output instead of JSON
-      fallbackArgs.push(instruction)
+      // Don't add instruction to array - add it quoted separately
 
       const fallbackCommand = envPrefix
-        ? `${envPrefix} gemini ${fallbackArgs.join(' ')}`
-        : `gemini ${fallbackArgs.join(' ')}`
+        ? `${envPrefix} gemini ${fallbackArgs.join(' ')} "${instruction}"`
+        : `gemini ${fallbackArgs.join(' ')} "${instruction}"`
       result = await runCommandInSandbox(sandbox, 'sh', ['-c', fallbackCommand])
 
       // If still failing, try the most basic approach
       if (!result.success && result.error?.includes('Tool') && result.error?.includes('not found in registry')) {
         await logger.info('Retrying with minimal flags...')
-        const minimalArgs = selectedModel ? ['-m', selectedModel, instruction] : [instruction]
+        const minimalArgs = selectedModel ? ['-m', selectedModel] : []
         const minimalCommand = envPrefix
-          ? `${envPrefix} gemini ${minimalArgs.join(' ')}`
-          : `gemini ${minimalArgs.join(' ')}`
+          ? `${envPrefix} gemini ${minimalArgs.join(' ')} "${instruction}"`
+          : `gemini ${minimalArgs.join(' ')} "${instruction}"`
         result = await runCommandInSandbox(sandbox, 'sh', ['-c', minimalCommand])
       }
     }
@@ -197,12 +287,12 @@ export async function executeGeminiInSandbox(
     }
 
     // Log more details for debugging
-    await logger.info(`Gemini CLI exit code: ${result.exitCode}`)
+    await logger.info('Gemini CLI execution completed')
     if (result.output) {
-      await logger.info(`Gemini CLI output length: ${result.output.length} characters`)
+      await logger.info('Gemini CLI output available')
     }
     if (result.error) {
-      await logger.error(`Gemini CLI error: ${result.error}`)
+      await logger.error('Gemini CLI error occurred')
     }
 
     // Check if any files were modified
