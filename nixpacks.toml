@@ -8,8 +8,8 @@ providers = ["node"]
 nixPkgs = ["nodejs_20", "pnpm"]
 
 [variables]
-NODE_ENV = "production"
 NEXT_TELEMETRY_DISABLED = "1"
+HUSKY = "0"
 
 [phases.install]
 dependsOn = ["setup"]
@@ -27,4 +27,4 @@ cmds = [
 
 [start]
 # Bind to 0.0.0.0 and use Dokploy-provided $PORT
-cmd = "pnpm run start -- -H 0.0.0.0 -p ${PORT:-3000}"
+cmd = "NODE_ENV=production pnpm run start -- -H 0.0.0.0 -p ${PORT:-3000}"
